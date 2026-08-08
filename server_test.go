@@ -3413,11 +3413,12 @@ func TestRequestCtxNoHijackNoResponse(t *testing.T) {
 }
 
 func TestRequestCtxInit(t *testing.T) {
-	// This test can't run parallel as it modifies globalConnID.
+	// This test can't run parallel as it modifies globalConnID. The store is
+	// atomic because a leftover connection may still be calling nextConnID.
 
 	var ctx RequestCtx
 	var logger testLogger
-	globalConnID = 0x123456
+	atomic.StoreUint64(&globalConnID, 0x123456)
 	ctx.Init(&ctx.Request, zeroTCPAddr, &logger)
 	ip := ctx.RemoteIP()
 	if !ip.IsUnspecified() {
@@ -4001,7 +4002,8 @@ func TestServerEmptyResponse(t *testing.T) {
 }
 
 func TestServerLogger(t *testing.T) {
-	// This test can't run parallel as it modifies globalConnID.
+	// This test can't run parallel as it modifies globalConnID. The store is
+	// atomic because a leftover connection may still be calling nextConnID.
 
 	cl := &testLogger{}
 	s := &Server{
@@ -4028,7 +4030,7 @@ func TestServerLogger(t *testing.T) {
 		},
 	}
 
-	globalConnID = 0
+	atomic.StoreUint64(&globalConnID, 0)
 
 	if err := s.ServeConn(rwx); err != nil {
 		t.Fatalf("Unexpected error from serveConn: %v", err)
