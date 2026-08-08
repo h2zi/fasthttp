@@ -4,6 +4,8 @@ package fasthttpadaptor
 
 import (
 	"bufio"
+	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -64,10 +66,23 @@ func NewFastHTTPHandler(h http.Handler) fasthttp.RequestHandler {
 		go func() {
 			defer func() {
 				if rec := recover(); rec != nil {
-					ctx.Logger().Printf("panic in net/http handler: %v", rec)
+					// ErrAbortHandler is net/http's quiet give-up.
+					mode := modePanicked
+					streamErr := errHandlerPanicked
+					if rec == http.ErrAbortHandler {
+						mode = modeAborted
+						streamErr = http.ErrAbortHandler
+					} else {
+						ctx.Logger().Printf("panic in net/http handler: %v", rec)
+					}
+					if w.pw != nil {
+						// A stream in flight must not end in a clean EOF; the
+						// error rides the body stream and cuts the connection.
+						_ = w.pw.CloseWithError(streamErr)
+					}
 
 					select {
-					case w.modeCh <- modePanicked:
+					case w.modeCh <- mode:
 					default:
 					}
 				} else {
@@ -140,35 +155,14 @@ func NewFastHTTPHandler(h http.Handler) fasthttp.RequestHandler {
 				w.mu.Unlock()
 			}
 
-			ctx.SetBodyStreamWriter(func(bw *bufio.Writer) {
-				// Ensure cleanup only after the stream completes.
-				defer releaseWriter(w)
-
-				// Send pre-flush bytes.
-				if b := w.consumePreflush(); len(b) > 0 {
-					_, _ = bw.Write(b)
-					_ = bw.Flush()
-				}
-
-				// Stream subsequent writes from the pipe until EOF.
-				buf := bufferPool.Get().(*[]byte) //nolint:forcetypeassert
-				defer bufferPool.Put(buf)
-
-				for {
-					n, err := w.pr.Read(*buf)
-					if n > 0 {
-						if _, e := bw.Write((*buf)[:n]); e != nil {
-							return
-						}
-						if e := bw.Flush(); e != nil {
-							return
-						}
-					}
-					if err != nil {
-						return
-					}
-				}
-			})
+			// The pipe feeds fasthttp's chunked writer directly, so the
+			// server truncates the response and drops the connection when a
+			// handler abort closes the pipe with an error.
+			body := io.Reader(w.pr)
+			if b := w.consumePreflush(); len(b) > 0 {
+				body = io.MultiReader(bytes.NewReader(b), w.pr)
+			}
+			ctx.Response.SetBodyStream(&streamBody{body: body, w: w}, -1)
 
 			// Signal the writer that streaming is ready so Flush() can return.
 			close(w.streamReady)
@@ -177,10 +171,37 @@ func NewFastHTTPHandler(h http.Handler) fasthttp.RequestHandler {
 			releaseWriter(w)
 			return
 
+		case modeAborted:
+			releaseWriter(w)
+			// Hijacking skips the response write and leaves teardown to the
+			// server, so a pooled per-IP wrapper is closed exactly once; the
+			// handler's Close only acts when KeepHijackedConns is set.
+			ctx.HijackSetNoResponse(true)
+			ctx.Hijack(func(c net.Conn) { _ = c.Close() })
+
 		case modePanicked:
 			panic("net/http handler panicked")
 		}
 	}
+}
+
+var errHandlerPanicked = errors.New("net/http handler panicked")
+
+// streamBody feeds a flushed response through fasthttp's chunked writer and
+// recycles the writer once the server is done with it.
+type streamBody struct {
+	body io.Reader
+	w    *writer
+}
+
+func (b *streamBody) Read(p []byte) (int, error) {
+	return b.body.Read(p)
+}
+
+func (b *streamBody) Close() error {
+	_ = b.w.pr.Close()
+	releaseWriter(b.w)
+	return nil
 }
 
 var bufferPool = sync.Pool{
@@ -195,6 +216,7 @@ const (
 	modeFlushed
 	modeHijacked
 	modePanicked
+	modeAborted
 )
 
 // Writer implements http.ResponseWriter + http.Flusher + http.Hijacker for the adaptor.
@@ -221,15 +243,11 @@ type writer struct {
 }
 
 func acquireWriter(ctx *fasthttp.RequestCtx) *writer {
-	pr, pw := io.Pipe()
 	return &writer{
-		ctx:          ctx,
-		h:            make(http.Header),
-		responseBody: nil,
-		pr:           pr,
-		pw:           pw,
-		modeCh:       make(chan int, 1),
-		streamReady:  make(chan struct{}),
+		ctx:         ctx,
+		h:           make(http.Header),
+		modeCh:      make(chan int, 1),
+		streamReady: make(chan struct{}),
 	}
 }
 
@@ -278,7 +296,11 @@ func (w *writer) Write(p []byte) (int, error) {
 }
 
 func (w *writer) Flush() {
+	if w.hijacked.Load() {
+		return
+	}
 	w.flushOnce.Do(func() {
+		w.pr, w.pw = io.Pipe()
 		select {
 		case w.modeCh <- modeFlushed:
 		default:
@@ -337,8 +359,9 @@ func (w *writer) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 
 func (w *writer) Close() error {
 	w.closeOnce.Do(func() {
-		_ = w.pw.Close()
-		_ = w.pr.Close()
+		if w.pw != nil {
+			_ = w.pw.Close()
+		}
 	})
 	return nil
 }

@@ -3,6 +3,7 @@ package fasthttpadaptor
 import (
 	"bufio"
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -10,6 +11,8 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"reflect"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -455,6 +458,11 @@ func TestHijackFlush(t *testing.T) {
 			if c, rw, err := f.Hijack(); err != nil {
 				t.Error(err)
 			} else {
+				// Flushing the ResponseWriter after Hijack must not block.
+				if fl, ok := w.(http.Flusher); ok {
+					fl.Flush()
+				}
+
 				if _, err := rw.WriteString("bar"); err != nil {
 					t.Error(err)
 				}
@@ -717,6 +725,8 @@ func TestWriterWriteRechecksStreamingReadyAfterLock(t *testing.T) {
 	}()
 
 	time.Sleep(10 * time.Millisecond)
+	// Flush builds the pipe before it makes streaming ready; do the same here.
+	w.pr, w.pw = io.Pipe()
 	close(w.streamReady)
 
 	readCh := make(chan []byte, 1)
@@ -799,5 +809,176 @@ func TestNewFastHTTPHandlerPresetStatusCodeOverriddenByHandler(t *testing.T) {
 	if ctx.Response.StatusCode() != fasthttp.StatusNotFound {
 		t.Fatalf("unexpected status code: %d. Expecting %d (handler's WriteHeader should win)",
 			ctx.Response.StatusCode(), fasthttp.StatusNotFound)
+	}
+}
+
+// A client vanishing mid-stream must not race the request's teardown.
+func TestHandlerStreamClientDisconnect(t *testing.T) {
+	t.Parallel()
+
+	s := &fasthttp.Server{Handler: NewFastHTTPHandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("chunk"))
+		w.(http.Flusher).Flush() //nolint:forcetypeassert
+		for range 50 {
+			if _, err := w.Write([]byte("more")); err != nil {
+				return
+			}
+		}
+	})}
+	ln := fasthttputil.NewInmemoryListener()
+	go s.Serve(ln) //nolint:errcheck
+	defer ln.Close()
+
+	for range 50 {
+		c, err := ln.Dial()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := c.Write([]byte("GET / HTTP/1.1\r\nHost: a\r\n\r\n")); err != nil {
+			t.Fatal(err)
+		}
+		buf := make([]byte, 64)
+		_, _ = c.Read(buf)
+		_ = c.Close()
+	}
+}
+
+// panic(http.ErrAbortHandler) gives up on the response without crashing.
+func TestHandlerAbortIsQuiet(t *testing.T) {
+	t.Parallel()
+
+	ctx := &fasthttp.RequestCtx{}
+	ctx.Request.Header.SetMethod(fasthttp.MethodGet)
+	ctx.Request.SetRequestURI("/")
+	ctx.Request.Header.SetHost("example.com")
+
+	NewFastHTTPHandlerFunc(func(http.ResponseWriter, *http.Request) {
+		panic(http.ErrAbortHandler)
+	})(ctx)
+}
+
+// An abort before the first write sends nothing, and the server tears the
+// connection down exactly once — through the per-IP wrapper too.
+func TestHandlerAbortWithPerIPLimit(t *testing.T) {
+	t.Parallel()
+
+	for _, keep := range []bool{false, true} {
+		s := &fasthttp.Server{
+			Handler: NewFastHTTPHandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/abort" {
+					panic(http.ErrAbortHandler)
+				}
+				_, _ = w.Write([]byte("ok"))
+			}),
+			MaxConnsPerIP:     1,
+			KeepHijackedConns: keep,
+		}
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		go s.Serve(ln) //nolint:errcheck
+
+		c, err := net.Dial("tcp", ln.Addr().String())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := c.Write([]byte("GET /abort HTTP/1.1\r\nHost: a\r\n\r\n")); err != nil {
+			t.Fatal(err)
+		}
+		_ = c.SetReadDeadline(time.Now().Add(2 * time.Second))
+		if b, err := io.ReadAll(c); err != nil || len(b) != 0 {
+			t.Fatalf("keep=%v: aborted response carried %q (err=%v), want nothing", keep, b, err)
+		}
+		_ = c.Close()
+
+		// The per-IP slot must free up and the server must still be serving.
+		var follow string
+		for range 50 {
+			c2, err := net.Dial("tcp", ln.Addr().String())
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, _ = c2.Write([]byte("GET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n"))
+			_ = c2.SetReadDeadline(time.Now().Add(2 * time.Second))
+			b, _ := io.ReadAll(c2)
+			_ = c2.Close()
+			follow = string(b)
+			if strings.Contains(follow, " 200 ") && strings.HasSuffix(follow, "ok") {
+				break
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		if !strings.Contains(follow, " 200 ") || !strings.HasSuffix(follow, "ok") {
+			t.Fatalf("keep=%v: follow-up response %q, want a 200 with body ok", keep, follow)
+		}
+		_ = ln.Close()
+	}
+}
+
+// Aborting after a Flush must neither hang the client on a body that never
+// completes nor let the connection serve a pipelined request, as in net/http.
+func TestHandlerAbortAfterFlush(t *testing.T) {
+	t.Parallel()
+
+	var secondServed atomic.Bool
+	s := &fasthttp.Server{Handler: NewFastHTTPHandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/" {
+			secondServed.Store(true)
+			return
+		}
+		_, _ = w.Write([]byte("partial"))
+		w.(http.Flusher).Flush() //nolint:forcetypeassert
+		panic(http.ErrAbortHandler)
+	})}
+	ln := fasthttputil.NewInmemoryListener()
+	go s.Serve(ln) //nolint:errcheck
+	defer ln.Close()
+
+	c, err := ln.Dial()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	if _, err := c.Write([]byte(
+		"GET / HTTP/1.1\r\nHost: a\r\n\r\nGET /second HTTP/1.1\r\nHost: a\r\n\r\n")); err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		br := bufio.NewReader(c)
+		resp, err := http.ReadResponse(br, nil)
+		if err != nil {
+			done <- err
+			return
+		}
+		defer resp.Body.Close()
+		first := make([]byte, len("partial"))
+		if _, err := io.ReadFull(resp.Body, first); err != nil {
+			done <- err
+			return
+		}
+		if _, err := io.ReadAll(resp.Body); err == nil {
+			done <- errors.New("the aborted body ended in a clean EOF")
+			return
+		}
+		if resp2, err := http.ReadResponse(br, nil); err == nil {
+			_ = resp2.Body.Close()
+			done <- errors.New("the connection served a second response after the abort")
+			return
+		}
+		done <- nil
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the body of an aborted flushed response never ended")
+	}
+	if secondServed.Load() {
+		t.Fatal("the handler ran for a pipelined request after the abort")
 	}
 }
