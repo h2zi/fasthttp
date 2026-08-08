@@ -4135,3 +4135,63 @@ func TestRequestHeaderEmptyPathWithQuery(t *testing.T) {
 		t.Fatalf("unexpected request line %q. Expecting %q", firstLine, "GET /?foo=bar HTTP/1.1")
 	}
 }
+
+func TestReadTrailerRecordsUnannouncedKeys(t *testing.T) {
+	t.Parallel()
+
+	var h RequestHeader
+	r := bufio.NewReader(strings.NewReader("X-Late: v\r\n\r\n"))
+	if err := h.ReadTrailer(r); err != nil {
+		t.Fatalf("ReadTrailer() error: %v", err)
+	}
+	keys := h.PeekTrailerKeys()
+	if len(keys) != 1 || string(keys[0]) != "X-Late" {
+		t.Fatalf("trailer keys = %q, want [X-Late]", keys)
+	}
+	if got := string(h.Peek("X-Late")); got != "v" {
+		t.Fatalf("Peek(X-Late) = %q, want v", got)
+	}
+}
+
+func TestTrailerHeaderKeepsEveryValue(t *testing.T) {
+	t.Parallel()
+
+	var h ResponseHeader
+	if err := h.SetTrailer("X-T"); err != nil {
+		t.Fatal(err)
+	}
+	h.Add("X-T", "one")
+	h.Add("X-T", "two")
+	if got := string(h.TrailerHeader()); got != "X-T: one\r\nX-T: two\r\n\r\n" {
+		t.Fatalf("TrailerHeader() = %q, want both values", got)
+	}
+}
+
+func TestAddTrailerKeepsRawHeaderMode(t *testing.T) {
+	t.Parallel()
+
+	var h RequestHeader
+	h.DisableSpecialHeader()
+	h.DisableNormalizing()
+	h.Add("trailer", "Foo")
+	if got := string(h.Peek("trailer")); got != "Foo" {
+		t.Fatalf("Peek(trailer) = %q, want it kept as a raw header", got)
+	}
+}
+
+func TestAddTrailerExtendsAnnouncedSet(t *testing.T) {
+	t.Parallel()
+
+	for _, header := range []interface {
+		Add(key, value string)
+		PeekTrailerKeys() [][]byte
+	}{&RequestHeader{}, &ResponseHeader{}} {
+		header.Add(HeaderTrailer, "Foo")
+		header.Add(HeaderTrailer, "Bar")
+		header.Add(HeaderTrailer, "Foo")
+		keys := header.PeekTrailerKeys()
+		if len(keys) != 2 {
+			t.Fatalf("%T trailer keys after Foo, Bar, Foo = %q, want a two-name set", header, keys)
+		}
+	}
+}

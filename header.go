@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"iter"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -514,6 +515,10 @@ func (h *header) AddTrailerBytes(trailer []byte) (err error) {
 		}
 		h.bufK = append(h.bufK[:0], key...)
 		normalizeHeaderKeyValidated(h.bufK, h.disableNormalizing)
+		// The announced set is a set; adding a known name is a no-op.
+		if slices.ContainsFunc(h.trailer, func(t []byte) bool { return bytes.Equal(t, h.bufK) }) {
+			continue
+		}
 		if cap(h.trailer) > len(h.trailer) {
 			h.trailer = h.trailer[:len(h.trailer)+1]
 			h.trailer[len(h.trailer)-1] = append(h.trailer[len(h.trailer)-1][:0], h.bufK...)
@@ -1411,7 +1416,9 @@ func (h *RequestHeader) del(key []byte) {
 }
 
 // setSpecialHeader handles special headers and return true when a header is processed.
-func (h *ResponseHeader) setSpecialHeader(key, value []byte) bool {
+// setSpecialHeader handles special headers and returns true when the header
+// is processed. add selects extend-vs-replace for set-typed headers (Trailer).
+func (h *ResponseHeader) setSpecialHeader(key, value []byte, add bool) bool {
 	if len(key) == 0 {
 		return false
 	}
@@ -1456,7 +1463,12 @@ func (h *ResponseHeader) setSpecialHeader(key, value []byte) bool {
 			// Transfer-Encoding is managed automatically.
 			return true
 		} else if caseInsensitiveCompare(strTrailer, key) {
-			_ = h.SetTrailerBytes(value)
+			// Adding to Trailer extends the announced set; Set replaces it.
+			if add {
+				_ = h.AddTrailerBytes(value)
+			} else {
+				_ = h.SetTrailerBytes(value)
+			}
 			return true
 		}
 	case 'd':
@@ -1474,8 +1486,9 @@ func (h *header) setNonSpecial(key, value []byte) {
 	h.h = setArgBytes(h.h, key, value, argsHasValue)
 }
 
-// setSpecialHeader handles special headers and return true when a header is processed.
-func (h *RequestHeader) setSpecialHeader(key, value []byte) bool {
+// setSpecialHeader handles special headers and returns true when the header
+// is processed. add selects extend-vs-replace for set-typed headers (Trailer).
+func (h *RequestHeader) setSpecialHeader(key, value []byte, add bool) bool {
 	if len(key) == 0 || h.disableSpecialHeader {
 		return false
 	}
@@ -1510,7 +1523,12 @@ func (h *RequestHeader) setSpecialHeader(key, value []byte) bool {
 			// Transfer-Encoding is managed automatically.
 			return true
 		} else if caseInsensitiveCompare(strTrailer, key) {
-			_ = h.SetTrailerBytes(value)
+			// Adding to Trailer extends the announced set; Set replaces it.
+			if add {
+				_ = h.AddTrailerBytes(value)
+			} else {
+				_ = h.SetTrailerBytes(value)
+			}
 			return true
 		}
 	case 'h':
@@ -1586,7 +1604,7 @@ func (h *ResponseHeader) AddBytesV(key string, value []byte) {
 // it will be sent after the chunked response body.
 func (h *ResponseHeader) AddBytesKV(key, value []byte) {
 	h.bufK, h.bufV = initHeaderKV(h.bufK, h.bufV, b2s(key), b2s(value), h.disableNormalizing)
-	if h.setSpecialHeader(h.bufK, h.bufV) {
+	if h.setSpecialHeader(h.bufK, h.bufV, true) {
 		return
 	}
 
@@ -1660,7 +1678,7 @@ func (h *ResponseHeader) SetBytesKV(key, value []byte) {
 // it will be sent after the chunked response body.
 func (h *ResponseHeader) SetCanonical(key, value []byte) {
 	h.bufV = initHeaderValueBytes(h.bufV, value)
-	if h.setSpecialHeader(key, h.bufV) {
+	if h.setSpecialHeader(key, h.bufV, false) {
 		return
 	}
 	h.setNonSpecial(key, h.bufV)
@@ -1817,7 +1835,7 @@ func (h *RequestHeader) AddBytesV(key string, value []byte) {
 // it will be sent after the chunked request body.
 func (h *RequestHeader) AddBytesKV(key, value []byte) {
 	h.bufK, h.bufV = initHeaderKV(h.bufK, h.bufV, b2s(key), b2s(value), h.disableNormalizing)
-	if h.setSpecialHeader(h.bufK, h.bufV) {
+	if h.setSpecialHeader(h.bufK, h.bufV, true) {
 		return
 	}
 
@@ -1891,7 +1909,7 @@ func (h *RequestHeader) SetBytesKV(key, value []byte) {
 // it will be sent after the chunked request body.
 func (h *RequestHeader) SetCanonical(key, value []byte) {
 	h.bufV = initHeaderValueBytes(h.bufV, value)
-	if h.setSpecialHeader(key, h.bufV) {
+	if h.setSpecialHeader(key, h.bufV, false) {
 		return
 	}
 	h.setNonSpecial(key, h.bufV)
@@ -2262,8 +2280,7 @@ func (h *header) tryReadTrailer(r *bufio.Reader, n int) error {
 		return fmt.Errorf("error when reading response trailer: %w", err)
 	}
 	b = mustPeekBuffered(r)
-	hh, headersLen, errParse := parseTrailer(b, h.h, h.disableNormalizing)
-	h.h = hh
+	headersLen, errParse := h.parseTrailer(b)
 	if errParse != nil {
 		if err == io.EOF {
 			return err
@@ -2452,18 +2469,22 @@ func (h *ResponseHeader) writeTrailer(w *bufio.Writer) error {
 	return err
 }
 
-// TrailerHeader returns response trailer header representation.
+// TrailerHeader returns the trailer section: one line per value received or
+// set for each trailer key. A key without a value is not emitted.
 //
 // Trailers will only be received with chunked transfer.
 //
 // The returned value is valid until the request is released,
 // either though ReleaseRequest or your request handler returning.
 // Do not store references to returned value. Make copies instead.
-func (h *ResponseHeader) TrailerHeader() []byte {
+func (h *header) TrailerHeader() []byte {
 	h.bufV = h.bufV[:0]
 	for _, t := range h.trailer {
-		value := h.peek(t)
-		h.bufV = appendHeaderLine(h.bufV, t, value)
+		for i := range h.h {
+			if bytes.Equal(h.h[i].key, t) {
+				h.bufV = appendHeaderLine(h.bufV, t, h.h[i].value)
+			}
+		}
 	}
 	h.bufV = append(h.bufV, strCRLF...)
 	return h.bufV
@@ -2582,23 +2603,6 @@ func (h *RequestHeader) Header() []byte {
 func (h *RequestHeader) writeTrailer(w *bufio.Writer) error {
 	_, err := w.Write(h.TrailerHeader())
 	return err
-}
-
-// TrailerHeader returns request trailer header representation.
-//
-// Trailers will only be received with chunked transfer.
-//
-// The returned value is valid until the request is released,
-// either though ReleaseRequest or your request handler returning.
-// Do not store references to returned value. Make copies instead.
-func (h *RequestHeader) TrailerHeader() []byte {
-	h.bufV = h.bufV[:0]
-	for _, t := range h.trailer {
-		value := h.peek(t)
-		h.bufV = appendHeaderLine(h.bufV, t, value)
-	}
-	h.bufV = append(h.bufV, strCRLF...)
-	return h.bufV
 }
 
 // RawHeaders returns raw header key/value bytes.
@@ -2728,7 +2732,7 @@ func (h *RequestHeader) parse(buf []byte) (int, error) {
 	return m + n, nil
 }
 
-func parseTrailer(src []byte, dest []argsKV, disableNormalizing bool) ([]argsKV, int, error) {
+func (h *header) parseTrailer(src []byte) (int, error) {
 	var s headerScanner
 	s.b = src
 
@@ -2741,23 +2745,26 @@ func parseTrailer(src []byte, dest []argsKV, disableNormalizing bool) ([]argsKV,
 			continue
 		}
 		// Key bytes were already validated by the scanner.
-		disable := disableNormalizing || s.keyHasSpace
+		disable := h.disableNormalizing || s.keyHasSpace
 		// Forbidden by RFC 7230, section 4.1.2
 		if isBadTrailer(s.key) {
-			return dest, 0, fmt.Errorf("forbidden trailer key %q", s.key)
+			return 0, fmt.Errorf("forbidden trailer key %q", s.key)
 		}
 		for _, ch := range s.value {
 			if !validHeaderValueByte(ch) {
-				return dest, 0, fmt.Errorf("invalid trailer value %q", s.value)
+				return 0, fmt.Errorf("invalid trailer value %q", s.value)
 			}
 		}
 		normalizeHeaderKeyValidated(s.key, disable)
-		dest = appendArgBytes(dest, s.key, s.value, argsHasValue)
+		h.h = appendArgBytes(h.h, s.key, s.value, argsHasValue)
+		// An unannounced field still arrived in the trailer section; record it
+		// so the trailer key set reflects what was received.
+		_ = h.AddTrailerBytes(s.key)
 	}
 	if s.err != nil {
-		return dest, 0, s.err
+		return 0, s.err
 	}
-	return dest, s.r, nil
+	return s.r, nil
 }
 
 func isBadTrailer(key []byte) bool {
