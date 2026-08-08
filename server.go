@@ -2420,6 +2420,7 @@ func (s *Server) serveConnCounted(c net.Conn, countConcurrency bool) error {
 			}
 		}
 
+		var firstByte bool
 		if !s.ReduceMemoryUsage || br != nil {
 			if br == nil {
 				br = acquireReader(ctx)
@@ -2437,11 +2438,23 @@ func (s *Server) serveConnCounted(c net.Conn, countConcurrency bool) error {
 						err = ErrNothingRead{error: err}
 					}
 				}
+				firstByte = len(b) != 0
+			} else {
+				// Only the arrival matters here; Header.Read reports any error.
+				b, _ := br.Peek(1)
+				firstByte = len(b) != 0
 			}
 		} else {
 			// On keep-alive connections acquireByteReader will read the first byte
 			// while the idle timeout is active.
 			br, err = acquireByteReader(&ctx)
+			firstByte = err == nil
+		}
+		if firstByte {
+			// Active from the first byte, so Shutdown never reclaims a request
+			// in flight; a peer that sends nothing stays idle.
+			idleConnTime.Store(0)
+			s.setState(c, StateActive)
 		}
 
 		ctx.Request.isTLS = isTLS
@@ -2455,9 +2468,6 @@ func (s *Server) serveConnCounted(c net.Conn, countConcurrency bool) error {
 		ctx.Response.secureErrorLogMessage = s.SecureErrorLogMessage
 
 		if err == nil {
-			idleConnTime.Store(0)
-			s.setState(c, StateActive)
-
 			if s.ReadTimeout > 0 {
 				if err = c.SetReadDeadline(time.Now().Add(s.ReadTimeout)); err != nil {
 					break
