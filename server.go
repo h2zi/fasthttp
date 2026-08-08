@@ -2403,6 +2403,7 @@ func (s *Server) serveConnCounted(c net.Conn, countConcurrency bool) error {
 	)
 	for {
 		connRequestNum++
+		markedActive := false
 
 		if connRequestNum == 1 {
 			// Apply ReadTimeout to the first request byte.
@@ -2455,9 +2456,6 @@ func (s *Server) serveConnCounted(c net.Conn, countConcurrency bool) error {
 		ctx.Response.secureErrorLogMessage = s.SecureErrorLogMessage
 
 		if err == nil {
-			idleConnTime.Store(0)
-			s.setState(c, StateActive)
-
 			if s.ReadTimeout > 0 {
 				if err = c.SetReadDeadline(time.Now().Add(s.ReadTimeout)); err != nil {
 					break
@@ -2495,6 +2493,12 @@ func (s *Server) serveConnCounted(c net.Conn, countConcurrency bool) error {
 			}
 
 			if err == nil {
+				// Active only once bytes arrive; an idle peer must stay
+				// reclaimable by Shutdown.
+				idleConnTime.Store(0)
+				s.setState(c, StateActive)
+				markedActive = true
+
 				if onHdrRecv := s.HeaderReceived; onHdrRecv != nil {
 					reqConf := onHdrRecv(&ctx.Request.Header)
 					if reqConf.ReadTimeout > 0 {
@@ -2543,6 +2547,12 @@ func (s *Server) serveConnCounted(c net.Conn, countConcurrency bool) error {
 		}
 
 		if err != nil {
+			// A clean EOF or an empty read carried no bytes; anything else
+			// means bytes arrived and the connection was active.
+			if _, silent := err.(ErrNothingRead); !silent && err != io.EOF && !markedActive {
+				idleConnTime.Store(0)
+				s.setState(c, StateActive)
+			}
 			if err == io.EOF {
 				err = nil
 			} else if nr, ok := err.(ErrNothingRead); ok {
