@@ -25,13 +25,20 @@ func ConvertRequest(ctx *fasthttp.RequestCtx, r *http.Request, forServer bool) e
 	}
 
 	r.Method = b2s(ctx.Method())
-	r.Proto = b2s(ctx.Request.Header.Protocol())
-	if r.Proto == "HTTP/2" {
-		r.ProtoMajor = 2
-	} else {
-		r.ProtoMajor = 1
+	// net/http spells the HTTP/2 version "HTTP/2.0", and its minor version is 0.
+	switch r.Proto = b2s(ctx.Request.Header.Protocol()); r.Proto {
+	case "HTTP/1.1":
+		r.ProtoMajor, r.ProtoMinor = 1, 1
+	case "HTTP/1.0":
+		r.ProtoMajor, r.ProtoMinor = 1, 0
+	case "HTTP/2", "HTTP/2.0":
+		r.Proto, r.ProtoMajor, r.ProtoMinor = "HTTP/2.0", 2, 0
+	default:
+		var ok bool
+		if r.ProtoMajor, r.ProtoMinor, ok = http.ParseHTTPVersion(r.Proto); !ok {
+			r.ProtoMajor, r.ProtoMinor = 1, 1
+		}
 	}
-	r.ProtoMinor = 1
 	r.ContentLength = int64(len(body))
 	r.RemoteAddr = ctx.RemoteAddr().String()
 	r.Host = b2s(ctx.Host())
@@ -58,11 +65,29 @@ func ConvertRequest(ctx *fasthttp.RequestCtx, r *http.Request, forServer bool) e
 		switch sk {
 		case "Transfer-Encoding":
 			r.TransferEncoding = append(r.TransferEncoding, sv)
+		case fasthttp.HeaderTrailer:
+			// The announcement lives in r.Trailer, not in the header map.
 		default:
 			if sk == fasthttp.HeaderCookie {
 				sv = strings.Clone(sv)
 			}
 			r.Header.Add(sk, sv)
+		}
+	}
+
+	// net/http surfaces trailers in Request.Trailer, not in the header map.
+	// fasthttp already parsed the received key set; the values sit in the
+	// header map copied above. A reused request must not keep old trailers.
+	r.Trailer = nil
+	if announced := ctx.Request.Header.PeekTrailerKeys(); len(announced) > 0 {
+		r.Trailer = make(http.Header, len(announced))
+		for _, k := range announced {
+			name := http.CanonicalHeaderKey(string(k))
+			r.Trailer[name] = nil
+			for _, v := range ctx.Request.Header.PeekAll(name) {
+				r.Trailer[name] = append(r.Trailer[name], b2s(v))
+			}
+			r.Header.Del(name)
 		}
 	}
 
