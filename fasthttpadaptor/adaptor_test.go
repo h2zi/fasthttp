@@ -982,3 +982,47 @@ func TestHandlerAbortAfterFlush(t *testing.T) {
 		t.Fatal("the handler ran for a pipelined request after the abort")
 	}
 }
+
+// A handler announces a trailer up front or sends one via http.TrailerPrefix;
+// both reach the wire exactly once, on a chunked body, flushed or buffered.
+func TestHandlerWritesTrailers(t *testing.T) {
+	t.Parallel()
+
+	for _, flush := range []bool{false, true} {
+		s := &fasthttp.Server{Handler: NewFastHTTPHandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set(fasthttp.HeaderTrailer, "X-Result")
+			_, _ = w.Write([]byte("body"))
+			if flush {
+				w.(http.Flusher).Flush() //nolint:forcetypeassert
+			}
+			w.Header().Add("X-Result", "done")
+			w.Header().Add("X-Result", "twice")
+			w.Header().Set(http.TrailerPrefix+"X-Late", "late")
+		})}
+		ln := fasthttputil.NewInmemoryListener()
+		go s.Serve(ln) //nolint:errcheck
+
+		c, err := ln.Dial()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := c.Write([]byte("GET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n")); err != nil {
+			t.Fatal(err)
+		}
+		raw, err := io.ReadAll(c)
+		if err != nil {
+			t.Fatal(err)
+		}
+		wire := string(raw)
+		for _, want := range []string{"Transfer-Encoding: chunked", "X-Result: done", "X-Result: twice", "X-Late: late"} {
+			if strings.Count(wire, want) != 1 {
+				t.Errorf("flush=%v: %q not exactly once in:\n%s", flush, want, wire)
+			}
+		}
+		if strings.Count(wire, "X-Result") != 3 { // the announcement plus both trailer lines
+			t.Errorf("flush=%v: wrong X-Result count in:\n%s", flush, wire)
+		}
+		_ = c.Close()
+		_ = ln.Close()
+	}
+}
