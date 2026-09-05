@@ -853,6 +853,25 @@ func TestHandlerFlushedHeadWithCompression(t *testing.T) {
 		_, _ = w.Write(bytes.Repeat([]byte("a"), 32*1024))
 		w.(http.Flusher).Flush() //nolint:forcetypeassert
 	}))}
+	hammerHead(t, s)
+}
+
+// The buffered body of a trailered response is served the same way.
+func TestHandlerTrailerHeadWithCompression(t *testing.T) {
+	t.Parallel()
+
+	s := &fasthttp.Server{Handler: fasthttp.CompressHandler(NewFastHTTPHandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Trailer", "X-Sum")
+		_, _ = w.Write(bytes.Repeat([]byte("a"), 32*1024))
+		w.Header().Set("X-Sum", "1")
+	}))}
+	hammerHead(t, s)
+}
+
+// hammerHead sends compressed HEAD requests over four connections at once.
+func hammerHead(t *testing.T, s *fasthttp.Server) {
+	t.Helper()
+
 	ln := fasthttputil.NewInmemoryListener()
 	go s.Serve(ln) //nolint:errcheck
 	defer ln.Close()
@@ -1130,5 +1149,49 @@ func TestHandlerFlushSendsHeaders(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("the flushed headers did not arrive while the handler was still running")
+	}
+}
+
+// A handler announces a trailer up front or sends one via http.TrailerPrefix;
+// both reach the wire exactly once, on a chunked body, flushed or buffered.
+func TestHandlerWritesTrailers(t *testing.T) {
+	t.Parallel()
+
+	for _, flush := range []bool{false, true} {
+		s := &fasthttp.Server{Handler: NewFastHTTPHandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set(fasthttp.HeaderTrailer, "X-Result")
+			_, _ = w.Write([]byte("body"))
+			if flush {
+				w.(http.Flusher).Flush() //nolint:forcetypeassert
+			}
+			w.Header().Add("X-Result", "done")
+			w.Header().Add("X-Result", "twice")
+			w.Header().Set(http.TrailerPrefix+"X-Late", "late")
+		})}
+		ln := fasthttputil.NewInmemoryListener()
+		go s.Serve(ln) //nolint:errcheck
+
+		c, err := ln.Dial()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := c.Write([]byte("GET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n")); err != nil {
+			t.Fatal(err)
+		}
+		raw, err := io.ReadAll(c)
+		if err != nil {
+			t.Fatal(err)
+		}
+		wire := string(raw)
+		for _, want := range []string{"Transfer-Encoding: chunked", "X-Result: done", "X-Result: twice", "X-Late: late"} {
+			if strings.Count(wire, want) != 1 {
+				t.Errorf("flush=%v: %q not exactly once in:\n%s", flush, want, wire)
+			}
+		}
+		if strings.Count(wire, "X-Result") != 3 { // the announcement plus both trailer lines
+			t.Errorf("flush=%v: wrong X-Result count in:\n%s", flush, wire)
+		}
+		_ = c.Close()
+		_ = ln.Close()
 	}
 }
