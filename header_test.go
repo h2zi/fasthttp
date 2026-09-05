@@ -4135,3 +4135,32 @@ func TestRequestHeaderEmptyPathWithQuery(t *testing.T) {
 		t.Fatalf("unexpected request line %q. Expecting %q", firstLine, "GET /?foo=bar HTTP/1.1")
 	}
 }
+
+func TestAddTrailerExtendsAnnouncedSet(t *testing.T) {
+	t.Parallel()
+
+	for _, header := range []interface {
+		Add(key, value string)
+		PeekTrailerKeys() [][]byte
+	}{&RequestHeader{}, &ResponseHeader{}} {
+		header.Add(HeaderTrailer, "Foo")
+		header.Add(HeaderTrailer, "Bar")
+		header.Add(HeaderTrailer, "Foo")
+		keys := header.PeekTrailerKeys()
+		if len(keys) != 2 {
+			t.Fatalf("%T trailer keys after Foo, Bar, Foo = %q, want a two-name set", header, keys)
+		}
+	}
+}
+
+func TestAddTrailerKeepsRawHeaderMode(t *testing.T) {
+	t.Parallel()
+
+	var h RequestHeader
+	h.DisableSpecialHeader()
+	h.DisableNormalizing()
+	h.Add("trailer", "Foo")
+	if got := string(h.Peek("trailer")); got != "Foo" {
+		t.Fatalf("Peek(trailer) = %q, want it kept as a raw header", got)
+	}
+}
